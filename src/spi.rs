@@ -25,7 +25,7 @@ use crate::memory::controller::interrupt::{
     InterruptCodeRegister, InterruptRegister, RxInterruptStatusRegister,
     RxOverflowInterruptStatusRegister, TxAttemptInterruptStatusRegister, TxInterruptStatusRegister,
 };
-use crate::memory::{is_valid_ram_address, Register, RepeatedRegister, SFRAddress};
+use crate::memory::{is_valid_ram_address, Register, RepeatedRegister, SFRAddress, RAM_BASE_ADDRESS};
 use crate::message::rx::{RxHeader, RxMessage};
 use crate::message::tx::{TxEventObject, TxHeader, TxMessage};
 use crate::message::{len_for_dlc, MAX_FD_BUFFER_SIZE};
@@ -1052,10 +1052,9 @@ where
 
     /// Reads multiple messages from an RX FIFO into the provided buffer.
     ///
-    /// This is the most efficient batch read method, using only 4 SPI transactions per message:
-    /// - 1x Status check (to verify message available)
-    /// - 1x UserAddressRegister read
-    /// - 1x Combined RAM read (header + timestamp + data)
+    /// This is the most efficient batch read method, using only 3 SPI transactions per message:
+    /// - 1x Combined status + address read (FifoStatusRegister + UserAddressRegister)
+    /// - 1x RAM read (header + timestamp + data)
     /// - 1x UINC byte write
     ///
     /// # Arguments
@@ -1086,19 +1085,14 @@ where
         let mut read_buf = [0u8; 76];
 
         while count < buffer.len() {
-            // Check if there are messages available (1 SPI transaction)
-            let status = self.read_repeated_register::<FifoStatusRegister>(fifo_number)?;
-            if !status.tfnrfnif() {
+            // Check status and get RAM address in one read (1 SPI transaction)
+            let (has_message, ram_address) = self.read_rx_fifo_status_and_address(fifo_number)?;
+            if !has_message {
                 break;
             }
 
-            // Get RAM address (1 SPI transaction)
-            let ram_address = self
-                .read_repeated_register::<UserAddressRegister>(UserAddressKind::Fifo(fifo_number))?
-                .calculate_ram_address();
-
             // Read message data (1 SPI transaction)
-            self.read_ram(ram_address as u16, &mut read_buf[..total_read_size])?;
+            self.read_ram(ram_address, &mut read_buf[..total_read_size])?;
 
             // Parse header
             let header = RxHeader([
@@ -1267,6 +1261,37 @@ where
             .map_err(|_| Error::SPIWrite)?;
 
         Ok(())
+    }
+
+    /// Reads FifoStatusRegister and UserAddressRegister in a single SPI transaction.
+    ///
+    /// Returns `(has_messages, ram_address)` where ram_address is the absolute RAM address.
+    /// Returns `Ok((false, 0))` if the FIFO is empty.
+    #[inline]
+    fn read_rx_fifo_status_and_address(&mut self, fifo_number: FifoNumber) -> Result<(bool, u16), Error> {
+        // STA and UA registers are adjacent (STA at offset 0, UA at offset 4)
+        let sta_address = FifoStatusRegister::get_address_for(fifo_number) as u16;
+
+        let mut instruction = Instruction(OpCode::READ);
+        instruction.set_address(sta_address);
+
+        let mut buf = [0u8; 8];
+        self.spi
+            .transaction(&mut [
+                Operation::Write(&instruction.into_spi_data()),
+                Operation::Read(&mut buf),
+            ])
+            .map_err(|_| Error::SPIRead)?;
+
+        let status = FifoStatusRegister(u32::from_le_bytes(buf[0..4].try_into().unwrap()));
+        if !status.tfnrfnif() {
+            return Ok((false, 0));
+        }
+
+        let ua = u32::from_le_bytes(buf[4..8].try_into().unwrap());
+        let ram_address = (ua + RAM_BASE_ADDRESS) as u16;
+
+        Ok((true, ram_address))
     }
 
     /* RAM related functions */
