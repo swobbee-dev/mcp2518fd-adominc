@@ -1021,13 +1021,111 @@ where
             return Ok(None);
         };
 
-        self.modify_repeated_register(fifo_number, |mut tefcon: FifoControlRegister| {
-            tefcon.set_uinc();
-            tefcon
-        })
-        ?;
+        self.rx_fifo_increment_head(fifo_number)?;
 
         Ok(Some(msg))
+    }
+
+    /// Increments the RX FIFO head pointer (UINC) using an optimized single-byte write.
+    ///
+    /// This is more efficient than a read-modify-write cycle since UINC is a
+    /// set-only bit that doesn't require reading the current register value.
+    #[inline]
+    fn rx_fifo_increment_head(&mut self, fifo_number: FifoNumber) -> Result<(), Error> {
+        // UINC is bit 8, which is bit 0 of byte 1 of the register.
+        // We can write just byte 1 with value 0x01 to set UINC without
+        // affecting other register bits.
+        let base_address = FifoControlRegister::get_address_for(fifo_number) as u16;
+        self.write_sfr_byte(base_address + 1, 0x01)
+    }
+
+    /// Gets the RX FIFO status without checking if it's an RX FIFO.
+    ///
+    /// Returns (has_messages, fifo_index) where:
+    /// - `has_messages` is true if there's at least one message available
+    /// - `fifo_index` is the current FIFO head pointer index (NOT the fill count)
+    #[inline]
+    pub fn rx_fifo_status(&mut self, fifo_number: FifoNumber) -> Result<(bool, u8), Error> {
+        let status = self.read_repeated_register::<FifoStatusRegister>(fifo_number)?;
+        Ok((status.tfnrfnif(), status.fifoci()))
+    }
+
+    /// Reads multiple messages from an RX FIFO into the provided buffer.
+    ///
+    /// This is the most efficient batch read method, using only 4 SPI transactions per message:
+    /// - 1x Status check (to verify message available)
+    /// - 1x UserAddressRegister read
+    /// - 1x Combined RAM read (header + timestamp + data)
+    /// - 1x UINC byte write
+    ///
+    /// # Arguments
+    /// * `fifo_number` - The FIFO to read from
+    /// * `timestamps_enabled` - Whether timestamps are enabled for this FIFO
+    /// * `max_data_bytes` - Maximum payload size configured for this FIFO
+    /// * `buffer` - Mutable slice to store received messages
+    ///
+    /// # Returns
+    /// The number of messages actually read into the buffer. Reading stops when:
+    /// - The buffer is full
+    /// - The FIFO is empty
+    ///
+    /// # Note
+    /// Caller must ensure the FIFO is configured for RX and that `max_data_bytes`
+    /// matches the FIFO's configured payload size.
+    pub fn rx_fifo_read_batch(
+        &mut self,
+        fifo_number: FifoNumber,
+        timestamps_enabled: bool,
+        max_data_bytes: usize,
+        buffer: &mut [RxMessage],
+    ) -> Result<usize, Error> {
+        let timestamp_size = if timestamps_enabled { 4 } else { 0 };
+        let total_read_size = round_up_spi_transfer_size(8 + timestamp_size + max_data_bytes);
+
+        let mut count = 0;
+        let mut read_buf = [0u8; 76];
+
+        while count < buffer.len() {
+            // Check if there are messages available (1 SPI transaction)
+            let status = self.read_repeated_register::<FifoStatusRegister>(fifo_number)?;
+            if !status.tfnrfnif() {
+                break;
+            }
+
+            // Get RAM address (1 SPI transaction)
+            let ram_address = self
+                .read_repeated_register::<UserAddressRegister>(UserAddressKind::Fifo(fifo_number))?
+                .calculate_ram_address();
+
+            // Read message data (1 SPI transaction)
+            self.read_ram(ram_address as u16, &mut read_buf[..total_read_size])?;
+
+            // Parse header
+            let header = RxHeader([
+                u32::from_le_bytes(read_buf[0..4].try_into().unwrap()),
+                u32::from_le_bytes(read_buf[4..8].try_into().unwrap()),
+            ]);
+
+            // Parse timestamp if enabled
+            let timestamp = if timestamps_enabled {
+                Some(u32::from_le_bytes(read_buf[8..12].try_into().unwrap()))
+            } else {
+                None
+            };
+
+            // Parse data
+            let data_offset = if timestamps_enabled { 12 } else { 8 };
+            let data_len = len_for_dlc(header.dlc(), header.fdf()).unwrap_or(0);
+
+            // Increment FIFO head pointer (1 SPI transaction)
+            self.rx_fifo_increment_head(fifo_number)?;
+
+            buffer[count] = RxMessage::new(header, timestamp, &read_buf[data_offset..data_offset + data_len])
+                .expect("DLC is 4 bits so data_len <= 64");
+            count += 1;
+        }
+
+        Ok(count)
     }
 
     /* Interrupt related operations */
@@ -1149,6 +1247,24 @@ where
                 Operation::Write(&value.to_le_bytes()),
             ])
                         .map_err(|_| Error::SPIRead)?;
+
+        Ok(())
+    }
+
+    /// Writes a single byte to an SFR address.
+    ///
+    /// This is useful for setting individual bits without a read-modify-write cycle,
+    /// such as the UINC bit which is a set-only bit at byte offset 1 of FIFOCONm.
+    fn write_sfr_byte(&mut self, address: u16, value: u8) -> Result<(), Error> {
+        let mut instruction = Instruction(OpCode::WRITE);
+        instruction.set_address(address);
+
+        self.spi
+            .transaction(&mut [
+                Operation::Write(&instruction.into_spi_data()),
+                Operation::Write(&[value]),
+            ])
+            .map_err(|_| Error::SPIWrite)?;
 
         Ok(())
     }
