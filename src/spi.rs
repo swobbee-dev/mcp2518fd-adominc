@@ -94,8 +94,65 @@ impl From<Error> for ConfigError {
     }
 }
 
-pub struct MCP2518FD<SPI> {
+/// Configuration for optimized batch reads from an RX FIFO.
+///
+/// This struct caches the memory layout of a specific FIFO to avoid
+/// reading configuration registers during the critical path.
+///
+/// # Creating this configuration
+///
+/// Use [`MCP2518FD::extract_rx_fifo_config`] to create this configuration
+/// automatically from the chip's registers. **Important:** This must be called
+/// when the FIFO is empty (e.g., immediately after configuration).
+///
+/// Alternatively, construct it manually if you know the FIFO layout.
+#[derive(Debug, Clone, Copy)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct RxFifoReadConfig {
+    /// The FIFO number (1-31)
+    pub fifo_number: FifoNumber,
+    /// The absolute starting RAM address of this FIFO
+    pub base_address: u16,
+    /// The size of a single message slot in bytes (Header + Timestamp + Payload), rounded up to 4
+    pub message_stride: u16,
+    /// The configured FIFO depth (1-32 messages)
+    pub fifo_depth: u16,
+    /// Whether timestamps are enabled for this FIFO
+    pub timestamps_enabled: bool,
+    /// The configured payload size in bytes
+    pub payload_size: usize,
+}
+
+impl RxFifoReadConfig {
+    /// Returns the RAM address immediately after this FIFO's region.
+    #[inline]
+    pub fn end_address(&self) -> u16 {
+        self.base_address + self.message_stride * self.fifo_depth
+    }
+}
+
+/// MCP2518FD CAN controller driver.
+///
+/// The `RX_CACHE_SIZE` const generic controls how many RX FIFO configurations
+/// can be cached for optimized batch reads. Default is 0 (no caching) for
+/// backwards compatibility.
+///
+/// # Caching
+/// When `RX_CACHE_SIZE > 0`, calling [`configure_fifo`](Self::configure_fifo) for an
+/// RX FIFO will automatically cache its configuration for use with
+/// [`rx_fifo_read_batch_cached`](Self::rx_fifo_read_batch_cached).
+///
+/// # Example
+/// ```ignore
+/// // No caching (default, backwards compatible)
+/// let mcp = MCP2518FD::new(spi);
+///
+/// // With caching for up to 2 RX FIFOs
+/// let mcp: MCP2518FD<_, 2> = MCP2518FD::new_with_cache(spi);
+/// ```
+pub struct MCP2518FD<SPI, const RX_CACHE_SIZE: usize = 0> {
     spi: SPI,
+    rx_fifo_configs: [Option<RxFifoReadConfig>; RX_CACHE_SIZE],
 }
 
 impl<SPI, SPIE> MCP2518FD<SPI>
@@ -103,9 +160,38 @@ where
     SPI: SpiDevice<u8, Error = SPIE>,
     SPIE: Debug,
 {
-    /// Constructs a new MCP2518FD controller from an SPI bus and CS GPIO pin
+    /// Constructs a new MCP2518FD controller (no RX FIFO config caching).
+    ///
+    /// This is the backwards-compatible constructor. For caching support, use
+    /// [`new_with_cache`](MCP2518FD::new_with_cache) instead.
     pub fn new(spi: SPI) -> MCP2518FD<SPI> {
-        Self { spi }
+        Self {
+            spi,
+            rx_fifo_configs: [],
+        }
+    }
+}
+
+impl<SPI, SPIE, const RX_CACHE_SIZE: usize> MCP2518FD<SPI, RX_CACHE_SIZE>
+where
+    SPI: SpiDevice<u8, Error = SPIE>,
+    SPIE: Debug,
+{
+    /// Constructs a new MCP2518FD controller with RX FIFO config caching.
+    ///
+    /// The cache size is determined by the `RX_CACHE_SIZE` const generic.
+    /// Use type annotation or turbofish syntax to specify the size:
+    ///
+    /// ```ignore
+    /// let mcp: MCP2518FD<_, 4> = MCP2518FD::new_with_cache(spi);
+    /// // or
+    /// let mcp = MCP2518FD::<_, 2>::new_with_cache(spi);
+    /// ```
+    pub fn new_with_cache(spi: SPI) -> Self {
+        Self {
+            spi,
+            rx_fifo_configs: [const { None }; RX_CACHE_SIZE],
+        }
     }
 
     /// Releases ownership of the SPI resources
@@ -120,9 +206,67 @@ where
 
         self.spi
             .write(&instruction.0.to_be_bytes())
-                        .map_err(|_| Error::SPIWrite)?;
+            .map_err(|_| Error::SPIWrite)?;
+
+        // Clear cached RX FIFO configs since reset clears all FIFO configurations
+        self.rx_fifo_configs = [const { None }; RX_CACHE_SIZE];
 
         Ok(())
+    }
+
+    /// Returns the cached RX FIFO configuration for the given FIFO, if available.
+    ///
+    /// The configuration is automatically cached when [`configure_fifo`](Self::configure_fifo)
+    /// is called with an RX FIFO configuration (and `RX_CACHE_SIZE > 0`).
+    ///
+    /// Returns `None` if:
+    /// - The FIFO has not been configured
+    /// - The FIFO is configured as TX
+    /// - The cache is full and this FIFO wasn't cached
+    /// - `RX_CACHE_SIZE` is 0 (caching disabled)
+    pub fn get_cached_rx_fifo_config(&self, fifo_number: FifoNumber) -> Option<&RxFifoReadConfig> {
+        self.rx_fifo_configs
+            .iter()
+            .filter_map(|slot| slot.as_ref())
+            .find(|config| config.fifo_number == fifo_number)
+    }
+
+    /// Caches an RX FIFO configuration.
+    ///
+    /// If an entry for this FIFO already exists, it is replaced.
+    /// Otherwise, the first empty slot is used.
+    /// If the cache is full, the configuration is silently dropped
+    /// (caller can still use [`extract_rx_fifo_config`](Self::extract_rx_fifo_config) manually).
+    fn cache_rx_fifo_config(&mut self, config: RxFifoReadConfig) {
+        // First, try to find existing entry for this FIFO
+        for slot in &mut self.rx_fifo_configs {
+            if let Some(existing) = slot {
+                if existing.fifo_number == config.fifo_number {
+                    *existing = config;
+                    return;
+                }
+            }
+        }
+        // Otherwise, use first empty slot
+        for slot in &mut self.rx_fifo_configs {
+            if slot.is_none() {
+                *slot = Some(config);
+                return;
+            }
+        }
+        // Cache full - silently drop
+    }
+
+    /// Removes a cached RX FIFO configuration.
+    fn remove_cached_rx_fifo_config(&mut self, fifo_number: FifoNumber) {
+        for slot in &mut self.rx_fifo_configs {
+            if let Some(existing) = slot {
+                if existing.fifo_number == fifo_number {
+                    *slot = None;
+                    return;
+                }
+            }
+        }
     }
 
     /// Does a full configuration sequence of the chip using the provided
@@ -410,11 +554,16 @@ where
 
     /// Configures a FIFO based on the settings provided. As per documentation, a single FIFO must
     /// be dedicated to RX or TX and all objects in that queue must have the same payload size.
+    ///
+    /// When `RX_CACHE_SIZE > 0` and configuring an RX FIFO, the configuration is automatically
+    /// cached for use with [`rx_fifo_read_batch_cached`](Self::rx_fifo_read_batch_cached).
     pub fn configure_fifo(
         &mut self,
         fifo_number: FifoNumber,
         fifo_config: FifoConfiguration,
     ) -> Result<(), Error> {
+        let is_rx_fifo = matches!(fifo_config.mode, settings::FifoMode::Receive(_));
+
         self.modify_repeated_register(fifo_number, |mut fifo_control: FifoControlRegister| {
             fifo_control.set_fifo_size(fifo_config.fifo_size);
             fifo_control.set_payload_size(fifo_config.payload_size);
@@ -457,8 +606,19 @@ where
             }
 
             fifo_control
-        })
-        ?;
+        })?;
+
+        // Auto-cache RX FIFO config if caching is enabled
+        if RX_CACHE_SIZE > 0 {
+            if is_rx_fifo {
+                // Extract and cache config (FIFO is empty right after configure)
+                let config = self.extract_rx_fifo_config(fifo_number)?;
+                self.cache_rx_fifo_config(config);
+            } else {
+                // Remove any stale RX config if this FIFO was previously configured as RX
+                self.remove_cached_rx_fifo_config(fifo_number);
+            }
+        }
 
         Ok(())
     }
@@ -1120,6 +1280,274 @@ where
         }
 
         Ok(count)
+    }
+
+    /// Extracts the configuration needed for [`rx_fifo_read_batch_fast`] from the chip's registers.
+    ///
+    /// # Important
+    /// This function **must** be called when the FIFO is empty (e.g., immediately after
+    /// [`configure`] or [`configure_fifo`]). This is because the MCP2518FD does not expose
+    /// a dedicated "Base Address" register for FIFOs - we rely on the `FIFOUA` (User Address)
+    /// register, which only points to the FIFO base when the FIFO is empty.
+    ///
+    /// # Errors
+    /// Returns [`Error::FifoNotRx`] if the specified FIFO is configured for TX.
+    pub fn extract_rx_fifo_config(
+        &mut self,
+        fifo_number: FifoNumber,
+    ) -> Result<RxFifoReadConfig, Error> {
+        let control = self.read_repeated_register::<FifoControlRegister>(fifo_number)?;
+
+        // Ensure it is actually an RX FIFO
+        if control.txen() {
+            return Err(Error::FifoNotRx);
+        }
+
+        // Determine stride (message size in RAM)
+        let payload_size = control.payload_size().num_bytes();
+        let timestamp_size = if control.rxtsen() { 4 } else { 0 };
+        let raw_size = 8 + timestamp_size + payload_size;
+        let message_stride = round_up_spi_transfer_size(raw_size) as u16;
+
+        // Determine FIFO depth
+        let fifo_depth = control.fifo_size() as u16;
+
+        // Get base address (requires FIFO to be empty so UA points to base)
+        let ua_reg = self.read_repeated_register::<UserAddressRegister>(
+            UserAddressKind::Fifo(fifo_number),
+        )?;
+        let base_address = ua_reg.calculate_ram_address() as u16;
+
+        Ok(RxFifoReadConfig {
+            fifo_number,
+            base_address,
+            message_stride,
+            fifo_depth,
+            timestamps_enabled: control.rxtsen(),
+            payload_size,
+        })
+    }
+
+    /// Extracts RX FIFO config by temporarily entering Configuration Mode
+    /// and resetting the FIFO to ensure accurate base address detection.
+    ///
+    /// This is safe to call even if the CAN bus is active - it will briefly
+    /// pause reception, reset the FIFO, extract config, then resume.
+    ///
+    /// # Warning
+    /// Any messages currently in the FIFO will be lost.
+    ///
+    /// # Errors
+    /// - Returns [`ConfigError`] if mode switching fails
+    /// - Returns [`Error::FifoNotRx`] (wrapped in [`ConfigError::Other`]) if the FIFO is configured for TX
+    pub fn extract_rx_fifo_config_with_reset(
+        &mut self,
+        fifo_number: FifoNumber,
+        delay: &mut impl DelayNs,
+    ) -> Result<RxFifoReadConfig, ConfigError> {
+        // 0. Save current operation mode to restore later
+        let original_mode = self.get_op_mode()?;
+
+        // 1. Enter configuration mode (stops CAN traffic)
+        self.set_op_mode(OperationMode::Configuration, delay)?;
+
+        // 2. Reset the FIFO (clears head/tail pointers back to base)
+        self.modify_repeated_register(fifo_number, |mut ctrl: FifoControlRegister| {
+            ctrl.set_freset();
+            ctrl
+        })?;
+
+        // 3. Extract config (FIFOUA now points to base address)
+        let config = self.extract_rx_fifo_config(fifo_number)?;
+
+        // 4. Restore original operation mode
+        self.set_op_mode(original_mode, delay)?;
+
+        Ok(config)
+    }
+
+    /// Optimized batch read using cached configuration and bulk RAM reads.
+    ///
+    /// This method reduces SPI transactions compared to [`rx_fifo_read_batch`] by:
+    /// 1. Using FIFOCI to compute exact message count (no guessing)
+    /// 2. Reading multiple contiguous messages in a single RAM transaction
+    /// 3. Handling FIFO wrap-around correctly
+    ///
+    /// # Arguments
+    /// * `config` - Configuration obtained from [`extract_rx_fifo_config`]
+    /// * `buffer` - Buffer to store received messages
+    /// * `scratchpad` - Working buffer for RAM reads (minimum: `config.message_stride` bytes,
+    ///                  larger enables bigger batch reads)
+    ///
+    /// # Returns
+    /// The number of messages read into the buffer.
+    ///
+    /// # Performance
+    /// For N messages: ~(N/batch_size + 1) RAM reads + N UINCs
+    /// vs standard 3N transactions.
+    pub fn rx_fifo_read_batch_fast(
+        &mut self,
+        config: &RxFifoReadConfig,
+        buffer: &mut [RxMessage],
+        scratchpad: &mut [u8],
+    ) -> Result<usize, Error> {
+        if buffer.is_empty() || scratchpad.len() < config.message_stride as usize {
+            return Ok(0);
+        }
+
+        // 1. Read status + address + tail index (1 SPI transaction)
+        let (has_message, head_addr, tail_index) =
+            self.read_rx_fifo_status_address_and_tail(config.fifo_number)?;
+
+        if !has_message {
+            return Ok(0);
+        }
+
+        // 2. Compute exact message count using circular buffer math
+        let head_index = (head_addr - config.base_address) / config.message_stride;
+        let msgs_available = if tail_index == head_index {
+            config.fifo_depth as usize // Full (we know not empty from above)
+        } else if tail_index > head_index {
+            (tail_index - head_index) as usize
+        } else {
+            (config.fifo_depth - head_index + tail_index) as usize
+        };
+
+        let total_to_read = msgs_available.min(buffer.len());
+        if total_to_read == 0 {
+            return Ok(0);
+        }
+
+        // 3. Batch read loop
+        let stride = config.message_stride as usize;
+        let scratchpad_capacity = scratchpad.len() / stride;
+        let mut messages_read = 0;
+        let mut current_addr = head_addr;
+
+        while messages_read < total_to_read {
+            // Calculate contiguous messages before wrap
+            let bytes_to_end = config.end_address().saturating_sub(current_addr) as usize;
+            let contiguous_slots = bytes_to_end / stride;
+
+            // Handle wrap boundary - if at end, wrap to base and retry
+            if contiguous_slots == 0 {
+                current_addr = config.base_address;
+                continue;
+            }
+
+            let remaining = total_to_read - messages_read;
+            let batch_count = remaining.min(contiguous_slots).min(scratchpad_capacity);
+
+            // Bulk RAM read
+            let read_size = round_up_spi_transfer_size(batch_count * stride);
+            self.read_ram(current_addr, &mut scratchpad[..read_size])?;
+
+            // Parse messages and UINC immediately after each
+            for i in 0..batch_count {
+                let offset = i * stride;
+                let msg_data = &scratchpad[offset..offset + stride];
+
+                let header = RxHeader([
+                    u32::from_le_bytes(msg_data[0..4].try_into().unwrap()),
+                    u32::from_le_bytes(msg_data[4..8].try_into().unwrap()),
+                ]);
+
+                let (timestamp, data_offset) = if config.timestamps_enabled {
+                    (
+                        Some(u32::from_le_bytes(msg_data[8..12].try_into().unwrap())),
+                        12,
+                    )
+                } else {
+                    (None, 8)
+                };
+
+                let data_len = len_for_dlc(header.dlc(), header.fdf()).unwrap_or(0);
+                let safe_len = data_len.min(config.payload_size);
+
+                buffer[messages_read + i] = RxMessage::new(
+                    header,
+                    timestamp,
+                    &msg_data[data_offset..data_offset + safe_len],
+                )
+                .expect("DLC is 4 bits so data_len <= 64");
+
+                // UINC immediately - free slot for new messages ASAP
+                self.rx_fifo_increment_head(config.fifo_number)?;
+            }
+
+            messages_read += batch_count;
+
+            // Advance address with wrap
+            let next_addr = current_addr + (batch_count as u16 * config.message_stride);
+            current_addr = if next_addr >= config.end_address() {
+                config.base_address + (next_addr - config.end_address())
+            } else {
+                next_addr
+            };
+        }
+
+        Ok(messages_read)
+    }
+
+    /// Optimized batch read using internally cached configuration.
+    ///
+    /// This is a convenience wrapper around [`rx_fifo_read_batch_fast`](Self::rx_fifo_read_batch_fast)
+    /// that uses the automatically cached RX FIFO configuration from [`configure_fifo`](Self::configure_fifo).
+    ///
+    /// # Errors
+    /// Returns [`Error::FifoNotRx`] if no cached configuration exists for this FIFO.
+    /// This happens when:
+    /// - `RX_CACHE_SIZE` is 0 (caching disabled)
+    /// - The FIFO was not configured via `configure_fifo`
+    /// - The FIFO was configured as TX
+    /// - The cache was full when this FIFO was configured
+    pub fn rx_fifo_read_batch_cached(
+        &mut self,
+        fifo_number: FifoNumber,
+        buffer: &mut [RxMessage],
+        scratchpad: &mut [u8],
+    ) -> Result<usize, Error> {
+        // Need to clone to avoid borrow conflict with self
+        let config = self
+            .get_cached_rx_fifo_config(fifo_number)
+            .cloned()
+            .ok_or(Error::FifoNotRx)?;
+        self.rx_fifo_read_batch_fast(&config, buffer, scratchpad)
+    }
+
+    /// Reads FifoStatusRegister and UserAddressRegister in a single SPI transaction,
+    /// returning the FIFO status, RAM address, and tail index (FIFOCI).
+    ///
+    /// Returns `(has_messages, ram_address, tail_index)`.
+    #[inline]
+    fn read_rx_fifo_status_address_and_tail(
+        &mut self,
+        fifo_number: FifoNumber,
+    ) -> Result<(bool, u16, u16), Error> {
+        // STA and UA registers are adjacent (STA at offset 0, UA at offset 4)
+        let sta_address = FifoStatusRegister::get_address_for(fifo_number) as u16;
+
+        let mut instruction = Instruction(OpCode::READ);
+        instruction.set_address(sta_address);
+
+        let mut buf = [0u8; 8];
+        self.spi
+            .transaction(&mut [
+                Operation::Write(&instruction.into_spi_data()),
+                Operation::Read(&mut buf),
+            ])
+            .map_err(|_| Error::SPIRead)?;
+
+        let status = FifoStatusRegister(u32::from_le_bytes(buf[0..4].try_into().unwrap()));
+        if !status.tfnrfnif() {
+            return Ok((false, 0, 0));
+        }
+
+        let ua = u32::from_le_bytes(buf[4..8].try_into().unwrap());
+        let ram_address = (ua + RAM_BASE_ADDRESS) as u16;
+        let tail_index = status.fifoci() as u16;
+
+        Ok((true, ram_address, tail_index))
     }
 
     /* Interrupt related operations */
