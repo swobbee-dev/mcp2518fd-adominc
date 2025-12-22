@@ -6,7 +6,7 @@ edition = "2021"
 license = "MIT"
 
 [dependencies]
-arbitrary-int = "1.2.7"
+arbitrary-int = "2.0"
 bitfield = "0.17.0"
 concat-idents = "1.1.5"
 embedded-can = "0.4.1"
